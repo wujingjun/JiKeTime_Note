@@ -2843,3 +2843,67 @@ commit;
 这样，即使在双方“同时”执行关注操作，最终数据库里的结果，也是 like 表里面有一条关于 A 和 B 的记录，而且 relation_ship 的值是 3， 并且 friend 表里面也有了 A 和 B 的这条记录。
 
 
+
+# "order by"是怎么工作的？
+
+在你开发应用的时候，一定会经常碰到需要根据指定的字段排序来显示结果的需求。还是以我们前面举例用过的市民表为例，假设你要查询城市是“杭州”的所有人名字，并且按照姓名排序返回前 1000 个人的姓名、年龄。
+
+假设这个表的部分定义是这样的：
+
+```sql
+
+CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `city` varchar(16) NOT NULL,
+  `name` varchar(16) NOT NULL,
+  `age` int(11) NOT NULL,
+  `addr` varchar(128) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `city` (`city`)
+) ENGINE=InnoDB;
+```
+
+这时，你的 SQL 语句可以这么写：
+
+```sql
+
+select city,name,age from t where city='杭州' order by name limit 1000  ;
+```
+
+
+
+## 全字段排序
+
+前面我们介绍过索引，所以你现在就很清楚了，为避免全表扫描，我们需要在 city 字段加上索引。
+
+在 city 字段上创建索引之后，我们用 explain 命令来看看这个语句的执行情况。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\826579b63225def812330ef6c344a303.png)
+
+Extra 这个字段中的“Using filesort”表示的就是需要排序，MySQL 会给每个线程分配一块内存用于排序，称为 sort_buffer。
+
+为了说明这个 SQL 查询语句的执行过程，我们先来看一下 city 这个索引的示意图。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\5334cca9118be14bde95ec94b02f0a3e.png" alt="img" style="zoom:67%;" />
+
+从图中可以看到，满足 city='杭州’条件的行，是从 ID_X 到 ID_(X+N) 的这些记录。
+
+通常情况下，这个语句执行流程如下所示 ：
+
+1. 初始化 sort_buffer,确定放入name，city，age这三个字段；
+2. 从索引city找到第一个满足city = '杭州'条件的主键Id，也就是途中的ID_X
+3. 到主键 id 索引取出整行，取 name、city、age 三个字段的值，存入 sort_buffer 中；
+4. 从索引 city 取下一个记录的主键 id；
+5. 重复步骤 3、4 直到 city 的值不满足查询条件为止，对应的主键 id 也就是图中的 ID_Y；
+6. 对 sort_buffer 中的数据按照字段 name 做快速排序；
+7. 按照排序结果取前 1000 行返回给客户端。
+
+我们暂且把这个排序过程，称为全字段排序，执行流程的示意图如下所示，下一篇文章中我们还会用到这个排序。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\6c821828cddf46670f9d56e126e3e772.jpg" alt="img" style="zoom:67%;" />
+
+图中“按 name 排序”这个动作，可能在内存中完成，也可能需要使用外部排序，这取决于排序所需的内存和参数 sort_buffer_size。
+
+sort_buffer_size，就是 MySQL 为排序开辟的内存（sort_buffer）的大小。如果要排序的数据量小于 sort_buffer_size，排序就在内存中完成。但如果排序数据量太大，内存放不下，则不得不利用磁盘临时文件辅助排序。
+
+你可以用下面介绍的方法，来确定一个排序语句是否使用了临时文件。
