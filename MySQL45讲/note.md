@@ -3673,3 +3673,5 @@ mysql> select d.* from tradelog l , trade_detail d where d.tradeid=CONVERT(l.tra
 
 
 # 为什么我只查一行的语句，也执行这么慢？
+
+
