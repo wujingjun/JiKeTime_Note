@@ -29,7 +29,7 @@ mysql -h$ip -P$port -u$user -p
 连接命令中的 mysql 是客户端工具，用来跟服务端建立连接。在完成经典的 TCP 握手后，连接器就要开始认证你的身份，这个时候用的就是你输入的用户名和密码。
 
 + 如果用户名或密码不对，你就会收到一个"Access denied for user"的错误，然后客户端程序结束执行。
-+ # **如果用户名密码认证通过，连接器会到权限表里面查出你拥有的权限。之后，这个连接里面的权限判断逻辑，都将依赖于此时读到的权限。**
++ 如果用户名密码认证通过，连接器会到权限表里面查出你拥有的权限。之后，这个连接里面的权限判断逻辑，都将依赖于此时读到的权限。
 
 这就意味着，一个用户成功建立连接后，即使你用管理员账号对这个用户的权限做了修改，也不会影响已经存在的连接的权限。修改完成后，只有再新建的连接才会使用新的权限设置。
 
@@ -3674,4 +3674,577 @@ mysql> select d.* from tradelog l , trade_detail d where d.tradeid=CONVERT(l.tra
 
 # 为什么我只查一行的语句，也执行这么慢？
 
+一般情况下，如果我跟你说查询性能优化，你首先会想到一些复杂的语句，想到查询需要返回大量的数据。但有些情况下，“查一行”，也会执行得特别慢。今天，我就跟你聊聊这个有趣的话题，看看什么情况下，会出现这个现象。
 
+需要说明的是，如果 MySQL 数据库本身就有很大的压力，导致数据库服务器 CPU 占用率很高或 ioutil（IO 利用率）很高，这种情况下所有语句的执行都有可能变慢，不属于我们今天的讨论范围。
+
+为了便于描述，我还是构造一个表，基于这个表来说明今天的问题。这个表有两个字段 id 和 c，并且我在里面插入了10万行记录。
+
+```sql
+mysql> CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=1;
+  while(i<=100000) do
+    insert into t values(i,i);
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+
+call idata();
+```
+
+
+
+
+
+## 第一类：查询长时间不返回
+
+如图 1 所示，在表 t 执行下面的 SQL 语句：
+
+```sql
+mysql> select * from t where id=1;
+```
+
+查询结果长时间不返回。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\8707b79d5ed906950749f5266014f22a.png)
+
+一般碰到这种情况的话，大概率是表 t 被锁住了。接下来分析原因的时候，一般都是首先执行一下 show processlist 命令，看看当前语句处于什么状态。
+
+然后我们再针对每种状态，去分析它们产生的原因、如何复现，以及如何处理
+
+
+
+
+
+### 等MDL锁
+
+如图2所示，就是使用show processlist 命令查看Waiting for table metadata lock的示意图
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\5008d7e9e22be88a9c80916df4f4b328.png)
+
+出现**这个状态表示的是，现在有一个线程正在表t上请求或者持有MDL写锁，把select语句堵住了。**
+
+在第 6 篇文章《全局锁和表锁 ：给表加个字段怎么有这么多阻碍？》中，我给你介绍过一种复现方法。但需要说明的是，那个复现过程是基于 MySQL 5.6 版本的。而 MySQL 5.7 版本修改了 MDL 的加锁策略，所以就不能复现这个场景了。
+
+不过，在 MySQL 5.7 版本下复现这个场景，也很容易。如图 3 所示，我给出了简单的复现步骤。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\742249a31b83f4858c51bfe106a5daca.png)
+
+session A 通过 lock table 命令持有表 t 的 MDL 写锁，而 session B 的查询需要获取 MDL 读锁。所以，session B 进入等待状态。
+
+这类问题的处理方式，就是找到谁持有 MDL 写锁，然后把它 kill 掉。
+
+但是，由于在 show processlist 的结果里面，session A 的 Command 列是“Sleep”，导致查找起来很不方便。不过有了 performance_schema 和 sys 系统库以后，就方便多了。（MySQL 启动时需要设置 performance_schema=on，相比于设置为 off 会有 10% 左右的性能损失)
+
+> 执行一下select * from performance_schema.setup_instruments where name='wait/lock/metadata/sql/mdl'，看一下ENABLED和TIMED是不是都是YES，只有两个都是YES的时候才能执行文章中说的操作。 具体可以参考官方文档： https://dev.mysql.com/doc/refman/5.7/en/sys-schema-table-lock-waits.html https://dev.mysql.com/doc/refman/5.7/en/metadata-locks-table.html UPDATE performance_schema.setup_instruments SET ENABLED = 'YES', TIMED = 'YES' where name='wait/lock/metadata/sql/mdl';
+
+通过查询 sys.schema_table_lock_waits 这张表，我们就可以直接找出造成阻塞的 process id，把这个连接用 kill 命令断开即可。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\74fb24ba3826e3831eeeff1670990c01.png" alt="img" style="zoom:67%;" />
+
+> 注意：这个查询是要在第三个会话才能查到
+
+
+
+
+
+### 等 flush
+
+接下来，我给你举另外一种查询被堵住的情况。
+
+我在表 t 上，执行下面的 SQL 语句：
+
+```sql
+mysql> select * from information_schema.processlist where id=1;
+```
+
+你可以看一下图 5。我查出来这个线程的状态是 Waiting for table flush，你可以设想一下这是什么原因。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\2d8250398bc7f8f7dce8b6b1923c3724.png)
+
+这个状态表示的是，现在有一个线程正要对表 t 做 flush 操作。MySQL 里面对表做 flush 操作的用法，一般有以下两个：
+
+```sql
+flush tables t with read lock;
+
+flush tables with read lock;
+```
+
+这两个 flush 语句，如果指定表 t 的话，代表的是只关闭表 t；如果没有指定具体的表名，则表示关闭 MySQL 里所有打开的表。
+
+但是正常这两个语句执行起来都很快，除非它们也被别的线程堵住了。
+
+所以，出现 Waiting for table flush 状态的可能情况是：有一个 flush tables 命令被别的语句堵住了，然后它又堵住了我们的 select 语句。
+
+复现步骤如图 6 所示：
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\2bbc77cfdb118b0d9ef3fdd679d0a69c.png)
+
+
+
+在 session A 中，我故意每行都调用一次 sleep(1)，这样这个语句默认要执行 10 万秒，在这期间表 t 一直是被 session A“打开”着。然后，session B 的 flush tables t 命令再要去关闭表 t，就需要等 session A 的查询结束。这样，session C 要再次查询的话，就会被 flush 命令堵住了。
+
+图 7 是这个复现步骤的 show processlist 结果。这个例子的排查也很简单，你看到这个 show processlist 的结果，肯定就知道应该怎么做了。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\398407014180be4146c2d088fc07357e.png)
+
+
+
+
+
+
+
+### 等行锁
+
+现在，经过了表级锁的考验，我们的select语句终于来到引擎里了。
+
+```sql
+mysql> select * from t where id=1 lock in share mode; 
+```
+
+>  mysql> select k from t where id=1 lock in share mode; mysql> select k from t where id=1 for update; select 语句如果加锁，是当前读；分别加了读锁（S 锁，共享锁）和写锁（X 锁，排他锁）。
+
+由于访问 id=1 这个记录时要加读锁，如果这时候已经有一个事务在这行记录上持有一个写锁，我们的 select 语句就会被堵住。
+
+复现步骤和现场如下：
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\3e68326b967701c59770612183277475.png)
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\3c266e23fc307283aa94923ecbbc738f.png)
+
+显然，session A 启动了事务，占有写锁，还不提交，是导致 session B 被堵住的原因。
+
+这个问题并不难分析，但问题是怎么查出是谁占着这个写锁。如果你用的是 MySQL 5.7 版本，可以通过 sys.innodb_lock_waits 表查到。
+
+查询方法是：
+
+```sql
+mysql> select * from t sys.innodb_lock_waits where locked_table='`test`.`t`'\G
+```
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\d8603aeb4eaad3326699c13c46379118.png" alt="img" style="zoom:67%;" />
+
+可以看到，这个信息很全，4 号线程是造成堵塞的罪魁祸首。而干掉这个罪魁祸首的方式，就是 KILL QUERY 4 或 KILL 4。
+
+不过，这里不应该显示“KILL QUERY 4”。这个命令表示停止 4 号线程当前正在执行的语句，而这个方法其实是没有用的。因为占有行锁的是 update 语句，这个语句已经是之前执行完成了的，现在执行 KILL QUERY，无法让这个事务去掉 id=1 上的行锁。
+
+> kill query pid只是停止指定线程正在执行的语句； kill pid能直接断开连接，当连接被断开才会回滚这个连接里面正在执行的线程，也就能释放行锁。
+
+实际上，KILL 4 才有效，也就是说直接断开这个连接。这里隐含的一个逻辑就是，连接被断开的时候，会自动回滚这个连接里面正在执行的线程，也就释放了 id=1 上的行锁。
+
+
+
+
+
+
+
+### 第二类：查询慢
+
+经过了重重封“锁”，我们再来看看一些查询慢的例子。
+
+先来看一条你一定知道原因的 SQL 语句：
+
+```sql
+mysql> select * from t where c=50000 limit 1;
+```
+
+由于字段 c 上没有索引，这个语句只能走 id 主键顺序扫描，因此需要扫描 5 万行。
+
+作为确认，你可以看一下慢查询日志。注意，这里为了把所有语句记录到 slow log 里，我在连接后先执行了 set long_query_time=0，将慢查询日志的时间阈值设置为 0。
+
+```
+# Time: 2023-06-28T07:21:14.524937Z
+# User@Host: root[root] @ localhost [127.0.0.1]  Id:    11
+# Query_time: 0.009865  Lock_time: 0.000062 Rows_sent: 1  Rows_examined: 50000
+SET timestamp=1687936874;
+/* ApplicationName=DataGrip 2023.1.2 */ select * from t1 where c=50000 limit 1;
+```
+
+Rows_examined 显示扫描了 50000 行。你可能会说，不是很慢呀，11.5 毫秒就返回了，我们线上一般都配置超过 1 秒才算慢查询。但你要记住：**坏查询不一定是慢查询**。我们这个例子里面只有 10 万行记录，数据量大起来的话，执行时间就线性涨上去了。
+
+扫描行数多，所以执行慢，这个很好理解。
+
+但是接下来，我们再看一个只扫描一行，但是执行很慢的语句。
+
+如图 12 所示，是这个例子的 slow log。可以看到，执行的语句是
+
+```sql
+mysql> select * from t where id=1；
+```
+
+虽然扫描行数是 1，但执行时间却长达 800 毫秒。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\66f26bb885401e8e460451ff6b0c0746.png)
+
+是不是有点奇怪呢，这些时间都花在哪里了？
+
+如果我把这个 slow log 的截图再往下拉一点，你可以看到下一个语句，select * from t where id=1 lock in share mode，执行时扫描行数也是 1 行，执行时间是 0.2 毫秒。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\bde83e269d9fa185b27900c8aa8137d2.png)
+
+看上去是不是更奇怪了？按理说 lock in share mode 还要加锁，时间应该更长才对啊。
+
+> lock in share mode 是当前读，直接返回结果， select是一致性读，需要通过undo log找到当前可见的版本数据
+
+可能有的同学已经有答案了。如果你还没有答案的话，我再给你一个提示信息，图 14 是这两个语句的执行输出结果。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\1fbb84bb392b6bfa93786fe032690b1c.png)
+
+第一个语句的查询结果里 c=1，带 lock in share mode 的语句返回的是 c=1000001。看到这里应该有更多的同学知道原因了。如果你还是没有头绪的话，也别着急。我先跟你说明一下复现步骤，再分析原因。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\84667a3449dc846e393142600ee7a2ff.png)
+
+你看到了，session A 先用 start transaction with consistent snapshot 命令启动了一个事务，之后 session B 才开始执行 update 语句。
+
+session B 执行完 100 万次 update 语句后，id=1 这一行处于什么状态呢？你可以从图 16 中找到答案。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\46bb9f5e27854678bfcaeaf0c3b8a98c.png" alt="img" style="zoom:67%;" />
+
+session B 更新完 100 万次，生成了 100 万个回滚日志 (undo log)。
+
+带 lock in share mode 的 SQL 语句，是当前读，因此会直接读到 1000001 这个结果，所以速度很快；而 select * from t where id=1 这个语句，是一致性读，因此需要从 1000001 开始，依次执行 undo log，执行了 100 万次以后，才将 1 这个结果返回。
+
+注意，undo log 里记录的其实是“把 2 改成 1”，“把 3 改成 2”这样的操作逻辑，画成减 1 的目的是方便你看图。
+
+
+
+## 上一期问题
+
+表结构如下：
+
+```sql
+mysql> CREATE TABLE `table_a` (
+  `id` int(11) NOT NULL,
+  `b` varchar(10) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `b` (`b`)
+) ENGINE=InnoDB;
+```
+
+假设现在表里面，有 100 万行数据，其中有 10 万行数据的 b 的值是’1234567890’， 假设现在执行语句是这么写的:
+
+```sql
+mysql> select * from table_a where b='1234567890abcd';
+```
+
+这时候，MySQL 会怎么执行呢？
+
+最理想的情况是，MySQL 看到字段 b 定义的是 varchar(10)，那肯定返回空呀。可惜，MySQL 并没有这么做。
+
+那要不，就是把’1234567890abcd’拿到索引里面去做匹配，肯定也没能够快速判断出索引树 b 上并没有这个值，也很快就能返回空结果。
+
+但实际上，MySQL 也不是这么做的。
+
+这条 SQL 语句的执行很慢，流程是这样的：
+
+1. 在传给引擎执行的时候，做了字符截断。因为引擎里面这个行只定义了长度是 10，所以只截了前 10 个字节，就是’1234567890’进去做匹配；
+2. 这样满足条件的数据有 10 万行；
+3. 因为是 select *， 所以要做 10 万次回表；
+4. 但是每次回表以后查出整行，到 server 层一判断，b 的值都不是’1234567890abcd’;
+5. 返回结果是空
+
+
+
+
+
+
+
+
+
+## 幻读是什么，幻读有什么问题？
+
+在上一篇文章最后，我给你留了一个关于加锁规则的问题。今天，我们就从这个问题说起吧。
+
+为了便于说明问题，这一篇文章，我们就先使用一个小一点儿的表。建表和初始化语句如下（为了便于本期的例子说明，我把上篇文章中用到的表结构做了点儿修改）：
+
+```sql
+CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  `d` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `c` (`c`)
+) ENGINE=InnoDB;
+
+insert into t values(0,0,0),(5,5,5),
+(10,10,10),(15,15,15),(20,20,20),(25,25,25);
+```
+
+这个表除了主键 id 外，还有一个索引 c，初始化语句在表中插入了 6 行数据。
+
+上期我留给你的问题是，下面的语句序列，是怎么加锁的，加的锁又是什么时候释放的呢？
+
+```sql
+begin;
+select * from t where d=5 for update;
+commit;
+```
+
+比较好理解的是，这个语句会命中 d=5 的这一行，对应的主键 id=5，因此在 select 语句执行完成后，id=5 这一行会加一个写锁，而且由于两阶段锁协议，这个写锁会在执行 commit 语句的时候释放。
+
+> 【回答1】对于问题的回答: 1. 全表扫描一般指 主键索引树扫描; 2. 对于会不会被加锁: 2.1 : RC级别下,只会在满足条件的行加行锁(直到事务commit/rollback才会释放),不满足的直接释放; 2.2: RR级别下会加行锁 + Gap lock,会将(0,5],(5,10],(10,15]这三个区间间隙锁起来（next-key lock是左开右闭, Gap-Lock是左开右开）;
+>
+> 【回答2】2.2好像有问题, 因为d上面没有索引,所以会全表扫描,根据后面第21讲的内容,应该访问到的都要加间隙锁,所以应该是行锁加全表的间隙锁
+>
+> 【回答3】对比了下 您的意思是（15，+∞）也会有锁 对吧
+
+由于字段 d 上没有索引，因此这条查询语句会做全表扫描。那么，其他被扫描到的，但是不满足条件的 5 行记录上，会不会被加锁呢？
+
+我们知道，InnoDB 的默认事务隔离级别是可重复读，所以本文接下来没有特殊说明的部分，都是设定在可重复读隔离级别下。
+
+
+
+
+
+## 幻读是什么？
+
+现在，我们就来分析一下，如果只在 id=5 这一行加锁，而其他行的不加锁的话，会怎么样。
+
+下面先来看一下这个场景（注意：这是我假设的一个场景）
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\5bc506e5884d21844126d26bbe6fa68b.png" alt="img" style="zoom:67%;" />
+
+可以看到，session A 里执行了三次查询，分别是 Q1、Q2 和 Q3。它们的 SQL 语句相同，都是 select * from t where d=5 for update。这个语句的意思你应该很清楚了，查所有 d=5 的行，而且使用的是当前读，并且加上写锁。现在，我们来看一下这三条 SQL 语句，分别会返回什么结果。
+
+1. Q1 只返回 id=5 这一行；
+2. 在 T2 时刻，session B 把 id=0 这一行的 d 值改成了 5，因此 T3 时刻 Q2 查出来的是 id=0 和 id=5 这两行；
+3. 在 T4 时刻，session C 又插入一行（1,1,5），因此 T5 时刻 Q3 查出来的是 id=0、id=1 和 id=5 的这三行。
+
+其中，Q3读到 id = 1这一行的现象，被称为”幻读“。也就是说，幻读指的是一个事务在前后两次查询同一个范围的时候，后一次查询看到了前一次查询没有看到的行
+
+> 在同一个事务中，两次读取到的数据不一致的情况称为幻读和不可重复读。幻读是针对insert导致的数据不一致，不可重复读是针对 delete、update导致的数据不一致。
+
+这里，我需要对“幻读”做一个说明：
+
+1. 在可重复读隔离级别下，普通的查询是快照读，是不会看到别的事务插入的数据的。因此，幻读在“当前读”下才会出现。
+2. 上面 session B的修改结果，被session A之后的select 语句用”当前读“看到，不能称为幻读。幻读仅专指"新插入的行"
+
+如果只从第 8 篇文章《事务到底是隔离的还是不隔离的？》我们学到的事务可见性规则来分析的话，上面这三条 SQL 语句的返回结果都没有问题。
+
+因为这三个查询都是加了 for update，都是当前读。而当前读的规则，就是要能读到所有已经提交的记录的最新值。并且，session B 和 sessionC 的两条语句，执行后就会提交，所以 Q2 和 Q3 就是应该看到这两个事务的操作效果，而且也看到了，这跟事务的可见性规则并不矛盾。
+
+但是却有问题。
+
+
+
+## 幻读有什么问题？
+
+**首先是语义上的**。session A 在 T1 时刻就声明了，“我要把所有 d=5 的行锁住，不准别的事务进行读写操作”。而实际上，这个语义被破坏了。
+
+如果现在这样看感觉还不明显的话，我再往 session B 和 session C 里面分别加一条 SQL 语句，你再看看会出现什么现象。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\7a9ffa90ac3cc78db6a51ff9b9075607.png" alt="img" style="zoom:67%;" />
+
+session B 的第二条语句 update t set c=5 where id=0，语义是“我把 id=0、d=5 这一行的 c 值，改成了 5”。
+
+由于在 T1 时刻，session A 还只是给 id=5 这一行加了行锁， 并没有给 id=0 这行加上锁。因此，session B 在 T2 时刻，是可以执行这两条 update 语句的。这样，就破坏了 session A 里 Q1 语句要锁住所有 d=5 的行的加锁声明。
+
+ession C 也是一样的道理，对 id=1 这一行的修改，也是破坏了 Q1 的加锁声明。
+
+**其次，是数据一致性的问题。**
+
+我们知道，锁的设计是为了保证数据的一致性。而这个一致性，不止是数据库内部数据状态在此刻的一致性，还包含了数据和日志在逻辑上的一致性。
+
+为了说明这个问题，我给 session A 在 T1 时刻再加一个更新语句，即：update t set d=100 where d=5。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\dcea7845ff0bdbee2622bf3c67d31d92.png" alt="img" style="zoom:67%;" />
+
+update 的加锁语义和 select …for update 是一致的，所以这时候加上这条 update 语句也很合理。session A 声明说“要给 d=5 的语句加上锁”，就是为了要更新数据，新加的这条 update 语句就是把它认为加上了锁的这一行的 d 值修改成了 100。
+
+现在，我们来分析一下图 3 执行完成后，数据库里会是什么结果。
+
+1. 经过 T1 时刻，id=5 这一行变成 (5,5,100)，当然这个结果最终是在 T6 时刻正式提交的；
+2. 经过 T2 时刻，id=0 这一行变成 (0,5,5);
+3. 经过 T4 时刻，表里面多了一行 (1,5,5);
+4. 其他行跟这个执行序列无关，保持不变。
+
+这样看，这些数据也没啥问题，但是我们再来看看这时候 binlog 里面的内容。
+
+1. T2 时刻，session B 事务提交，写入了两条语句；
+2. T4 时刻，session C 事务提交，写入了两条语句；
+3. T6 时刻，session A 事务提交，写入了 update t set d=100 where d=5 这条语句。
+
+我统一放到一起的话，就是这样的：
+
+```sql
+update t set d=5 where id=0; /*(0,0,5)*/
+update t set c=5 where id=0; /*(0,5,5)*/
+
+insert into t values(1,1,5); /*(1,1,5)*/
+update t set c=5 where id=1; /*(1,5,5)*/
+
+update t set d=100 where d=5;/*所有d=5的行，d改成100*/
+```
+
+> 注意，这里的语句执行顺序是按照事务提交时间顺序记录的
+
+好，你应该看出问题了。这个语句序列，不论是拿到备库去执行，还是以后用 binlog 来克隆一个库，这三行的结果，都变成了 (0,5,100)、(1,5,100) 和 (5,5,100)。
+
+也就是说，id=0 和 id=1 这两行，发生了数据不一致。这个问题很严重，是不行的。
+
+到这里，我们再回顾一下，**这个数据不一致到底是怎么引入的？**
+
+我们分析一下可以知道，这是我们假设“select * from t where d=5 for update 这条语句只给 d=5 这一行，也就是 id=5 的这一行加锁”导致的。
+
+我们把扫描过程中碰到的行，也都加上写锁，再来看看执行效果。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\34ad6478281709da833856084a1e3447.png" alt="img" style="zoom:67%;" />
+
+由于 session A 把所有的行都加了写锁，所以 session B 在执行第一个 update 语句的时候就被锁住了。需要等到 T6 时刻 session A 提交以后，session B 才能继续执行。
+
+这样对于 id=0 这一行，在数据库里的最终结果还是 (0,5,5)。在 binlog 里面，执行序列是这样的：
+
+```sql
+insert into t values(1,1,5); /*(1,1,5)*/
+update t set c=5 where id=1; /*(1,5,5)*/
+
+update t set d=100 where d=5;/*所有d=5的行，d改成100*/
+
+update t set d=5 where id=0; /*(0,0,5)*/
+update t set c=5 where id=0; /*(0,5,5)*/
+```
+
+可以看到，按照日志顺序执行，id=0 这一行的最终结果也是 (0,5,5)。所以，id=0 这一行的问题解决了。
+
+但同时你也可以看到，id=1 这一行，在数据库里面的结果是 (1,5,5)，而根据 binlog 的执行结果是 (1,5,100)，也就是说幻读的问题还是没有解决。为什么我们已经这么“凶残”地，把所有的记录都上了锁，还是阻止不了 id=1 这一行的插入和更新呢？
+
+原因很简单。在 T3 时刻，我们给所有行加锁的时候，id=1 这一行还不存在，不存在也就加不上锁。
+
+也就是说，即使把所有的记录都加上锁，还是阻止不了新插入的记录，这也是为什么“幻读”会被单独拿出来解决的原因。
+
+到这里，其实我们刚说明完文章的标题 ：幻读的定义和幻读有什么问题。
+
+接下来，我们再看看 InnoDB 怎么解决幻读的问题。
+
+
+
+## 如何解决幻读？
+
+现在你知道了，产生幻读的原因是，行锁只能锁住行，但是新插入记录这个动作，要更新的是记录之间的“间隙”。因此，为了解决幻读问题，InnoDB 只好引入新的锁，也就是间隙锁 (Gap Lock)。
+
+顾名思义，间隙锁，锁的就是两个值之间的空隙。比如文章开头的表 t，初始化插入了 6 个记录，这就产生了 7 个间隙。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\e7f7ca0d3dab2f48c588d714ee3ac861.png" alt="img" style="zoom:67%;" />
+
+这样，当你执行 select * from t where d=5 for update 的时候，就不止是给数据库中已有的 6 个记录加上了行锁，还同时加了 7 个间隙锁。这样就确保了无法再插入新的记录。
+
+也就是说这时候，在一行行扫描的过程中，不仅将给行加上了行锁，还给行两边的空隙，也加上了间隙锁。
+
+> 这样可以避免瞬间加上整个表的写锁，提高并发度； 被扫到了的部分才加上间隙锁，其他事务要等自己想要插入的间隙的间隙锁被释放了，才能顺利插入
+
+现在你知道了，数据行是可以加上锁的实体，数据行之间的间隙，也是可以加上锁的实体。但是间隙锁跟我们之前碰到过的锁都不太一样。
+
+比如行锁，分成读锁和写锁。下图就是这两种类型行锁的冲突关系。
+
+![img](D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\c435c765556c0f3735a6eda0779ff151.png)
+
+也就是说，跟行锁有冲突关系的是“另外一个行锁”。
+
+但是间隙锁不一样，跟间隙锁存在冲突关系的，是“往这个间隙中插入一个记录”这个操作。间隙锁之间都不存在冲突关系。
+
+这句话不太好理解，我给你举个例子：
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\7c37732d936650f1cda7dbf27daf7498.png" alt="img" style="zoom:67%;" />
+
+这里 session B 并不会被堵住。因为表 t 里并没有 c=7 这个记录，因此 session A 加的是间隙锁 (5,10)。而 session B 也是在这个间隙加的间隙锁。它们有共同的目标，即：保护这个间隙，不允许插入值。但，它们之间是不冲突的。
+
+间隙锁和行锁合称 next-key lock，每个 next-key lock 是前开后闭区间。也就是说，我们的表 t 初始化以后，如果用 select * from t for update 要把整个表所有记录锁起来，就形成了 7 个 next-key lock，分别是 (-∞,0]、(0,5]、(5,10]、(10,15]、(15,20]、(20, 25]、(25, +supremum]。
+
+你可能会问说，这个 supremum 从哪儿来的呢？
+
+这是因为 +∞是开区间。实现上，InnoDB 给每个索引加了一个不存在的最大值 supremum，这样才符合我们前面说的“都是前开后闭区间”。
+
+间隙锁和 next-key lock 的引入，帮我们解决了幻读的问题，但同时也带来了一些“困扰”。
+
+在前面的文章中，就有同学提到了这个问题。我把他的问题转述一下，对应到我们这个例子的表来说，业务逻辑这样的：任意锁住一行，如果这一行不存在的话就插入，如果存在这一行就更新它的数据，代码如下：
+
+```sql
+begin;
+select * from t where id=N for update;
+
+/*如果行不存在*/
+insert into t values(N,N,N);
+/*如果行存在*/
+update t set d=N set id=N;
+
+commit;
+```
+
+可能你会说，这个不是 insert … on duplicate key update 就能解决吗？但其实在有多个唯一键的时候，这个方法是不能满足这位提问同学的需求的。至于为什么，我会在后面的文章中再展开说明。
+
+> 使用INSERT的时候 有表T(id,A,B,C,D)
+>
+> 插入的时候希望通过A,B索引唯一记录 ，有重复的时候更新C,D
+>
+> INSERT INTO T(A,B,C,D) VALUES (a,b,c,d) ON DUPLICATE KEY UPDATE C=C+1，D=d 
+>
+> 
+>
+> 这条语句相当于：
+>
+> ```sql
+> INSERT INTO ... VALUES ...
+> ```
+>
+> 当INSERT(因为主键或唯一键冲突)失败时，执行
+>
+> ```sql
+> UPDATE ... SET ... WHERE A = a AND B = b
+> ```
+
+现在，我们就只讨论这个逻辑。
+
+这个同学碰到的现象是，这个逻辑一旦有并发，就会碰到死锁。你一定也觉得奇怪，这个逻辑每次操作前用 for update 锁起来，已经是最严格的模式了，怎么还会有死锁呢？
+
+这里，我用两个 session 来模拟并发，并假设 N=9。
+
+<img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\df37bf0bb9f85ea59f0540e24eb6bcbe.png" alt="img" style="zoom: 67%;" />
+
+你看到了，其实都不需要用到后面的 update 语句，就已经形成死锁了。我们按语句执行顺序来分析一下：
+
+1. session A 执行 select … for update 语句，由于 id=9 这一行并不存在，因此会加上间隙锁 (5,10);
+2. session B 执行 select … for update 语句，同样会加上间隙锁 (5,10)，间隙锁之间不会冲突，因此这个语句可以执行成功；
+3. session B 试图插入一行 (9,9,9)，被 session A 的间隙锁挡住了，只好进入等待；
+4. session A 试图插入一行 (9,9,9)，被 session B 的间隙锁挡住了。
+
+至此，两个 session 进入互相等待状态，形成死锁。当然，InnoDB 的死锁检测马上就发现了这对死锁关系，让 session A 的 insert 语句报错返回了。
+
+你现在知道了，间隙锁的引入，可能会导致同样的语句锁住更大的范围，这其实是影响了并发度的。其实，这还只是一个简单的例子，在下一篇文章中我们还会碰到更多、更复杂的例子。
+
+你可能会说，为了解决幻读的问题，我们引入了这么一大串内容，有没有更简单一点的处理方法呢。
+
+我在文章一开始就说过，如果没有特别说明，今天和你分析的问题都是在可重复读隔离级别下的，间隙锁是在可重复读隔离级别下才会生效的。所以，你如果把隔离级别设置为读提交的话，就没有间隙锁了。但同时，你要解决可能出现的数据和日志不一致问题，需要把 binlog 格式设置为 row。这，也是现在不少公司使用的配置组合。
+
+> 为什么在读提交级别下，binlog_format需要设置为row？？ 原因是在可重复读级别下，有行锁 + 间隙锁 = next-key锁 来保证不出现幻读以及binlog不出现错误； 但在读提交级别下，是不会加间隙锁的，所以需要修改binlog_format；
+>
+> 1.间隙锁是可重复读隔离级别下解决幻读的，同时解决了binlog可能的sql执行顺序错误问题。 
+>
+> 2.间隙锁解决了binlog的问题，不是binlog解决了间隙锁问题。 
+>
+> 3.读提交级别也有binlog执行顺序错误的问题，也没有间隙锁，所以用binlog的row模式解决了binlog可能出现错误的问题。 
+>
+> 4.binlog的row模式比statement要记录的更全面，每行记录改变都记录下来，导致日志大，同时io次数多。
+
+前面文章的评论区有同学留言说，他们公司就使用的是读提交隔离级别加 binlog_format=row 的组合。他曾问他们公司的 DBA 说，你为什么要这么配置。DBA 直接答复说，因为大家都这么用呀。
+
+关于这个问题本身的答案是，如果读提交隔离级别够用，也就是说，业务不需要可重复读的保证，这样考虑到读提交下操作数据的锁范围更小（没有间隙锁），这个选择是合理的。
+
+但其实我想说的是，配置是否合理，跟业务场景有关，需要具体问题具体分析。
+
+但是，如果 DBA 认为之所以这么用的原因是“大家都这么用”，那就有问题了，或者说，迟早会出问题。
+
+比如说，大家都用读提交，可是逻辑备份的时候，mysqldump 为什么要把备份线程设置成可重复读呢？（这个我在前面的文章中已经解释过了，你可以再回顾下第 6 篇文章《全局锁和表锁 ：给表加个字段怎么有这么多阻碍？》的内容）
+
+> 官方自带的逻辑备份工具是 mysqldump。当 mysqldump 使用参数–single-transaction 的时候，导数据之前就会启动一个事务，来确保拿到一致性视图。而由于 MVCC 的支持，这个过程中数据是可以正常更新的。
+
+然后，在备份期间，备份线程用的是可重复读，而业务线程用的是读提交。同时存在两种事务隔离级别，会不会有问题？
