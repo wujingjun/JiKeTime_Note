@@ -4624,17 +4624,17 @@ max_connections 的计算，不是看谁在 running，是只要连着就占用�
 这是一个“古老”的 DDL 方案。平时在做变更的时候，你应该考虑类似 gh-ost 这样的方案，更加稳妥。但是在需要紧急处理时，上面这个方案的效率是最高的。
 
 > gh-ost的方法 
->
+> 
 > 1、首先新建一张ghost表，结构与源表相同 
->
+> 
 > 2、使用alter命令修改ghost表 
->
+> 
 > 3.1、模拟从库命令获取主库上该表的binlog(基于全镜像的行模式的binlog包含更改前和更改后的所有数据)，并解析成语句到ghost表上执行。 
->
+> 
 > 3.2、获取源表的数据范围（如按照主键获取到最大值和最小值），然后将数据拆分为多个批次拷贝插入到ghost表中 4、锁住源表，防止用户修改源表数据 
->
+> 
 > 5、将源表重命名，将ghost表改名为源表 
->
+> 
 > 6、释放表锁，清理gh-ost工具产生的表。
 
 
@@ -4656,10 +4656,6 @@ call query_rewrite.flush_rewrite_rules();
 这里，call query_rewrite.flush_rewrite_rules() 这个存储过程，是让插入的新规则生效，也就是我们说的“查询重写”。你可以用图 4 中的方法来确认改写规则是否生效。
 
 <img src="D:\JiKeTime\JiKeTime_Note\MySQL45讲\note.assets\47a1002cbc4c05c74841591d20f7388a.png" alt="img" style="zoom:67%;" />
-
-
-
-
 
 ### 导致慢查询的第三种可能，就是碰上了我们在第 10 篇文章《MySQL 为什么有时候会选错索引？》中提到的情况，MySQL 选错了索引。
 
@@ -4715,9 +4711,8 @@ call query_rewrite.flush_rewrite_rules();
 1. 由于是 order by c desc，第一个要定位的是索引 c 上“最右边的”c=20 的行，所以会加上间隙锁 (20,25) 和 next-key lock (15,20]。
 
 2. 在索引 c 上向左遍历，要扫描到 c=10 才停下来，所以 next-key lock 会加到 (5,10]，这正是阻塞 session B 的 insert 语句的原因。
-
+   
    > 【评论1】next-key lock 是左开右闭，一个索引的落在了右闭上即为这个索引的next-key lock，这个和查询顺序无关。 所以c>=15 and c <=20 order by c desc 从右向左，扫描到c=10才停止，c=10的next-key lock为(5,10] 故c上加锁(5,25) 如果去除order by c desc即从左向右，扫描到c=25才停止，c=25的next-key lock为(20,25] 故c上加锁(10,25] 而不是(10，+∞)
-   >
    > 【自我理解】扫描到了就要加锁
 
 3. 在扫描过程中，c=20、c=15、c=10 这三行都存在值，由于是 select *，所以会在主键 id 上加三个行锁。
@@ -4726,8 +4721,8 @@ call query_rewrite.flush_rewrite_rules();
 
 1. 索引 c 上 (5, 25)；
 2. 主键索引上 id=15、20 两个行锁。
-
-
+   
+   
 
 **每次加锁都会说明是加在“哪个索引上”的。因为，锁就是加在索引上的，这是 InnoDB 的一个基础设定**
 
@@ -4735,7 +4730,7 @@ call query_rewrite.flush_rewrite_rules();
 
 
 
-## MySQL是怎么保证数据不丢的？
+# MySQL是怎么保证数据不丢的？
 
 在专栏前面文章和答疑篇中，我都着重介绍了 WAL 机制（你可以再回顾下第 2 篇、第 9 篇、第 12 篇和第 15 篇文章中的相关内容），得到的结论是：只要 redo log 和 binlog 保证持久化到磁盘，就能确保 MySQL 异常重启后，数据可以恢复。
 
@@ -4782,5 +4777,46 @@ write 和 fsync 的时机，是由参数 sync_binlog 控制的：
 
 然后就有同学问了，redo log buffer 里面的内容，是不是每次生成后都要直接持久化到磁盘呢？
 
+答案是，不需要。
+
+如果事务执行期间 MySQL发生异常重启了，那这部分日志就丢了。由于事务并没有提交，所以这时日志丢了也不会有损失。
+
+那么，另外一个问题是，事务还没提交的时候，redo log buffer 中的部分日志有没有可能被持久化到磁盘呢？
+
+答案是，确实会有。
+
+这个问题，要从 redo log 可能存在的三种状态说起。这三种状态，对应的就是图 2 中的三个颜色块。
+
+<img title="" src="https://static001.geekbang.org/resource/image/9d/d4/9d057f61d3962407f413deebc80526d4.png?wh=1142*639" alt="" data-align="center" style="zoom:67%;">
+
+这三种状态分别是：
+
+1. 存在 redo log buffer中，物理上是在 MySQL 进程内存中，就是图中的红色部分；
+
+2. 写到磁盘（write），但是没有持久化（fsync），物理上是在文件系统的 page cache 里面，也就是图中的黄色部分；
+
+3. 持久化到磁盘，对应的是 hard disk，也就是图中的绿色部分。
+
+
+
+日志写到 redo log buffer 是很快的，wirte 到 page cache 也差不多，但是持久化到磁盘的速度就慢多了。
+
+> 金字塔结构，越远离CPU的存储器IO越慢 日志 --> MySQL进程内存中（redo log buffer） --> write到文件系统（page cache）--> fsync 持久化到磁盘 和bin log 好像一样啊
+
+为了控制 redo log 的写入策略，InnoDB 提供了 innodb_flush_log_at_trx_commit 参数，它有三种可能取值：
+
+1. 设置为 0 的时候，表示每次事务提交时都只是把 redo log 留在 redo log buffer中；
+
+2. 设置为 1 的时候，表示每次提交事务都将 redo log 直接持久化到磁盘；
+
+3. 设置为 2 的时候，表示每次事务提交时都只是把 redo log 写到 page cache；
+
+
+
+InnoDB 有一个后台线程，每隔 1 秒，就会把 redo log buffer 中的日志，调用 write 写到文件系统的 page cache，然后调用 fsync 持久化到磁盘。
+
+注意，事务执行中间过程的 redo log 也是直接写在 redo log buffer 中的，这些 redo log 也会被后台线程一起持久化到磁盘。也就是说，一个没有提交的事务的 redo log，也是可能已经持久化到磁盘的。
+
+实际上，除了后台线程每秒一次的轮询操作外，还有两种场景会让一个没有提交的事务的 redo log 写入到磁盘中。
 
 
